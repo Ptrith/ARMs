@@ -145,7 +145,7 @@ java -cp bin:libs/commons-cli-1.4.jar main.RunRMS_streaming \
 
 ## Contributing & contact
 
-- **Issues:** [GitHub Issues](https://github.com/YOUR_USERNAME/YOUR_REPO/issues) — replace with your repository URL after publication.
+
 - **Email:** [lzixu00@gmail.com](mailto:lzixu00@gmail.com)
 
 Pull requests (bug fixes, clearer docs, small portability fixes) are welcome; please keep changes focused and match existing code style.
