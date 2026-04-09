@@ -1,4 +1,4 @@
-# SS-RMS: Streaming Sampled Regret Minimization Set
+# AS-SRMS: Streaming Sampled Regret Minimization Set
 
 [![Java](https://img.shields.io/badge/Java-8%2B-orange.svg)](https://adoptium.net/)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#)
