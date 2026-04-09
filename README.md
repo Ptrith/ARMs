@@ -4,8 +4,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **Important:** Run every shell command in this **project root** — the directory that contains `src/`, `libs/`, and `dataset/`.  
-> If your checkout nests this folder (e.g. `.../AS-SRMS/Code/`), `cd` into it first. Using `java -cp bin:...` from a parent folder causes `ClassNotFoundException` because `bin/` is resolved relative to the current working directory.
+tFoundException` because `bin/` is resolved relative to the current working directory.
 
 ## Abstract
 
