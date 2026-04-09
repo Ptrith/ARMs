@@ -1,0 +1,2 @@
+# Datasets are large; keep locally. Some paths exceed GitHub's 100 MiB blob limit.
+dataset/

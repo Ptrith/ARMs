@@ -4,14 +4,13 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **Important:** Run every shell command in this **project root** — the directory that contains `src/`, `libs/`, and `dataset/`.  
-> If your checkout nests this folder (e.g. `.../AS-SRMS/Code/`), `cd` into it first. Using `java -cp bin:...` from a parent folder causes `ClassNotFoundException` because `bin/` is resolved relative to the current working directory.
+tFoundException` because `bin/` is resolved relative to the current working directory.
 
 ## Abstract
 
 In the big-data setting, concise summaries help users cope with massive datasets. **Regret minimization set (RMS)** is a standard approach to such summarization. With sensing, social networks, and related sources, however, data often arrive as a **stream**. Prior RMS work targets **static** data or **dynamic** data with explicit updates (insertions, deletions, etc.); adapting those methods to streaming can be **inefficient or inaccurate** in both theory and practice. This motivates **regret minimization on streaming data**. We study an **adaptive sampling** scheme: utility vectors (encoding preferences over attributes) are drawn from historical information and **adjusted online** as new tuples arrive. In the paper we analyze **time complexity** *O(N)*, **space complexity** *O(1)*, and **approximation ratio** *1 − 1/e* with respect to the total number of tuples *N*, and we report experiments showing **faster running time and better approximation** than baselines.
 
-**This repository** is the companion implementation: it processes the stream in **windows** (contiguous chunks; each chunk is one file in `dataset/...`), maintains a bounded representative set, and supports the adaptive / fixed / uniform sampling modes used in the empirical study. **Users** can **compile** the Java sources and run the bundled NBA (or other) splits as described below.
+**This repository** is the companion implementation: it processes the stream in **windows** (contiguous chunks; each chunk is one file in `dataset/...`), maintains a bounded representative set, and supports the adaptive / fixed / uniform sampling modes used in the empirical study. **Users** can **compile** the Java sources and run with NBA or other splits once **`dataset/`** is populated locally, as described below.
 
 **Keywords:** Regret minimization set, streaming data, sampling.
 
@@ -30,7 +29,7 @@ Optional: add a **`LICENSE`** file in this directory if you publish the repo; th
 | **`src/structures/`** | Core logic and indexes: `StreamingState`, `StreamingRMS`, `DualTree`, `KdTree`, `ConeTree`, `QualityMetrics`, plus supporting types (`SetCover`, `RMSInst`, `Operations`, `RankItem`, `TopKResult`, …). |
 | **`src/utils/`** | Shared helpers, mainly `VectorUtil` (norms, cosine, unit vectors) and small tuple/type utilities. |
 | **`libs/`** | Third-party JARs (Commons CLI). |
-| **`dataset/`** | Example inputs (streaming window files and raw sources where provided). |
+| **`dataset/`** | Example inputs (streaming window files). **Not in this Git remote** — create the folder locally (see `.gitignore`) to avoid GitHub size limits. |
 | **`bin/`** | Created by you when compiling; holds `.class` files (safe to delete; regenerate with `javac`). |
 
 ## Input data format (window files)
@@ -145,7 +144,7 @@ java -cp bin:libs/commons-cli-1.4.jar main.RunRMS_streaming \
 
 ## Contributing & contact
 
-- **Issues:** [GitHub Issues](https://github.com/YOUR_USERNAME/YOUR_REPO/issues) — replace with your repository URL after publication.
+
 - **Email:** [lzixu00@gmail.com](mailto:lzixu00@gmail.com)
 
 Pull requests (bug fixes, clearer docs, small portability fixes) are welcome; please keep changes focused and match existing code style.
