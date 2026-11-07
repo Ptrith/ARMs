@@ -3,145 +3,204 @@ package structures;
 import utils.VectorUtil;
 import java.util.*;
 
-/**
- * Core streaming RMS: sampled utilities over merged Q and current window, bounded |Q|.
- */
+/** Maintains a bounded representative set from the previous set and the current input batch. */
 public class StreamingRMS {
-    
+
+    private static final boolean RAW_COVERAGE = true;
+    private static final boolean QUALITY_MAX = true;
+
+    private static final boolean VERIFY_LAZY = Boolean.getBoolean("srms.verifyLazy");
+    private static long lazyEvaluations, scanEquivalentEvaluations;
+    public static String lazyStats() { return lazyEvaluations + "," + scanEquivalentEvaluations; }
+
+    /** Orders candidates by marginal gain, then score, then stable candidate index. */
+    private static boolean gainBetter(int a, int b, double[] gains, double[] quality) {
+        return gains[a] > gains[b] || (gains[a] == gains[b] &&
+            (quality[a] > quality[b] || (quality[a] == quality[b] && a < b)));
+    }
+    private static void siftGainDown(int[] heap, int size, int pos, double[] gains, double[] quality) {
+        int value = heap[pos];
+        while (2 * pos + 1 < size) {
+            int child = 2 * pos + 1;
+            if (child + 1 < size && gainBetter(heap[child + 1], heap[child], gains, quality)) child++;
+            if (!gainBetter(heap[child], value, gains, quality)) break;
+            heap[pos] = heap[child]; pos = child;
+        }
+        heap[pos] = value;
+    }
+
     private final int dim;
     @SuppressWarnings("unused")
     private final int k;
     @SuppressWarnings("unused")
     private final double eps;
-    /** Mixing coefficient between absolute score and marginal gain. */
+
     private final double alpha;
-    
+
     public StreamingState state;
     private DualTree dualTree;
-    
-    /** Maps row index in merged data to label (Q_* or B_*). */
-    private Map<Integer, String> indexMap;
-    
-    /** Euclidean norm of each row using first dim coordinates (before sphere embed). */
+
+    private int[] selectedPointIndices;
+
     private double[] dataMagnitudes;
-    
+
     public double samplingTime = 0.0;
     public double indexTime = 0.0;
     public double scoringTime = 0.0;
     public double selectionTime = 0.0;
-    
+
     public double samplingMemMB = 0.0;
     public double indexMemMB = 0.0;
     public double scoringMemMB = 0.0;
     public double selectionMemMB = 0.0;
-    
+
     private boolean incrementalUsed = false;
+
+    /** Directions, source identities and weights used together throughout the current batch. */
+    private CurrentUtilityPool currentPool;
+
+    /** Deduplicates directions while retaining coordinate-axis provenance. */
+    private static final class SampleBuffer {
+        final List<double[]> vectors = new ArrayList<>();
+        final List<CurrentUtilityPool.Source> sources = new ArrayList<>();
+        private final Set<DirectionKey> seen = new HashSet<>();
+
+        boolean add(double[] vector, CurrentUtilityPool.Source source) {
+            if (!seen.add(new DirectionKey(vector))) {
+                return false;
+            }
+            vectors.add(vector);
+            sources.add(source);
+            return true;
+        }
+
+        int size() {
+            return vectors.size();
+        }
+
+        boolean isEmpty() {
+            return vectors.isEmpty();
+        }
+    }
 
     private static double usedMemMB() {
         Runtime rt = Runtime.getRuntime();
         long used = rt.totalMemory() - rt.freeMemory();
         return used / (1024.0 * 1024.0);
     }
-    
-    /**
-     * @param batch_data tuples arriving in the current window (already sphere-embedded rows).
-     */
+
+    /** Merges candidates, constructs utility samples and prepares the scoring index. */
     public StreamingRMS(int dim, int k, double eps, double alpha, StreamingState state, double[][] batch_data) {
         this.dim = dim;
         this.k = k;
         this.eps = eps;
         this.alpha = StreamingState.normalizeAlpha(alpha);
         this.state = state;
-        this.indexMap = new HashMap<>();
-        
+
         long t0 = System.nanoTime();
-        
+
         double[][] merged_data = mergeQAndBatch(batch_data);
-        
+
         double[][] samples = generateStreamingSamples(merged_data, batch_data.length);
-        
+
         long t1 = System.nanoTime();
         this.samplingTime = (t1 - t0) / 1e6;
         this.samplingMemMB = usedMemMB();
-        
+
         int total_size = merged_data.length;
         buildOrUpdateIndex(merged_data, samples, total_size);
-        
+
         long t2 = System.nanoTime();
         this.indexTime = (t2 - t1) / 1e6;
         this.indexMemMB = usedMemMB();
     }
-    
+
     public StreamingRMS(int dim, int k, double eps, StreamingState state, double[][] batch_data) {
         this(dim, k, eps, state != null ? state.alpha : StreamingState.DEFAULT_ALPHA, state, batch_data);
     }
-    
+
+    /** Builds the current index or updates a compatible prior index. */
     private void buildOrUpdateIndex(double[][] merged_data, double[][] samples, int total_size) {
-        Set<Integer> current_Q_indices = new HashSet<>();
+        boolean buildIndex = state == null
+            || !StreamingState.INDEX_MODE_NONE.equals(StreamingState.normalizeIndexMode(state.indexMode));
+        if (!buildIndex) {
+            this.incrementalUsed = false;
+            this.dualTree = new DualTree(dim, k, eps, total_size, total_size,
+                                         samples.length, merged_data, samples, false, true);
+            return;
+        }
+
+        Set<Integer> current_Q_indices = new HashSet<>(Math.max(16, state.Q.size() * 2));
         for (int i = 0; i < state.Q.size(); i++) {
             current_Q_indices.add(state.Q.get(i).original_idx);
         }
-        
+
         int overlap = 0;
         for (int idx : current_Q_indices) {
             if (state.prev_Q_indices.contains(idx)) {
                 overlap++;
             }
         }
-        
-        double overlap_ratio = state.prev_Q_indices.isEmpty() ? 0.0 : 
+
+        double overlap_ratio = state.prev_Q_indices.isEmpty() ? 0.0 :
                               (double) overlap / state.prev_Q_indices.size();
-        
-        boolean use_incremental = state.enable_incremental && 
-                                 overlap_ratio > 0.7 && 
+
+        boolean use_incremental = state.enable_incremental &&
+                                 overlap_ratio > 0.7 &&
                                  state.current_batch > 0;
-        
+
         if (use_incremental && this.dualTree != null) {
+
             this.incrementalUsed = true;
+
             this.dualTree.data = merged_data;
             this.dualTree.samples = samples;
             this.dualTree.data_size = total_size;
             this.dualTree.sample_size = samples.length;
-            
+            this.dualTree.resetSampleDotCache();
+
             Set<Integer> to_delete = new HashSet<>(state.prev_Q_indices);
             to_delete.removeAll(current_Q_indices);
-            
+            if (!to_delete.isEmpty()) {
+
+            }
+
             int Q_size = state.Q.size();
             for (int i = Q_size; i < total_size; i++) {
                 this.dualTree.insert(i);
             }
-            
+
             this.dualTree.uIdx = new ConeTree(dim + 1, k, eps, 0.99, this.dualTree);
-            
+
         } else {
-            this.dualTree = new DualTree(dim, k, eps, total_size, total_size, 
-                                         samples.length, merged_data, samples);
+
+            this.dualTree = new DualTree(dim, k, eps, total_size, total_size,
+                                         samples.length, merged_data, samples, true, true);
         }
     }
-    
+
+    /** Forms the ordered candidate set: previous representatives followed by the current batch. */
     private double[][] mergeQAndBatch(double[][] batch_data) {
         int Q_size = state.Q.size();
         int B_size = batch_data.length;
         int total_size = Q_size + B_size;
-        
+
         double[][] merged = new double[total_size][dim + 1];
         dataMagnitudes = new double[total_size];
-        
+
         for (int i = 0; i < Q_size; i++) {
             dataMagnitudes[i] = computeOriginalNorm(state.Q.get(i).vector);
             System.arraycopy(state.Q.get(i).vector, 0, merged[i], 0, dim + 1);
-            indexMap.put(i, "Q_" + i);
         }
-        
+
         for (int i = 0; i < B_size; i++) {
             dataMagnitudes[Q_size + i] = computeOriginalNorm(batch_data[i]);
             System.arraycopy(batch_data[i], 0, merged[Q_size + i], 0, dim + 1);
-            indexMap.put(Q_size + i, "B_" + i);
         }
-        
+
         return merged;
     }
-    
+
     private double computeOriginalNorm(double[] vector) {
         double sum = 0.0;
         for (int d = 0; d < dim; d++) {
@@ -149,8 +208,7 @@ public class StreamingRMS {
         }
         return Math.sqrt(sum);
     }
-    
-    /** adaptive | fixed | uniform utility sampling. */
+
     private double[][] generateStreamingSamples(double[][] data, int batch_size) {
         String samplingMode = StreamingState.normalizeSamplingMode(state.samplingMode);
         if (StreamingState.SAMPLING_FIXED.equals(samplingMode)) {
@@ -162,10 +220,11 @@ public class StreamingRMS {
         return generateAdaptiveSamples(data, batch_size);
     }
 
+    /** Combines retained directions, perturbed representative directions and new batch directions. */
     private double[][] generateAdaptiveSamples(double[][] data, int batch_size) {
         int s = state.sample_size;
-        List<double[]> samples = new ArrayList<>();
-        Random rand = new Random(42);
+        SampleBuffer samples = new SampleBuffer();
+        Random rand = new Random(state.samplingSeed);
 
         int n_hist = (int)(s * state.ratio_hist);
         if (!state.U_hist.isEmpty()) {
@@ -173,7 +232,11 @@ public class StreamingRMS {
             sorted_hist.sort((a, b) -> Double.compare(b.weight, a.weight));
 
             for (int i = 0; i < Math.min(n_hist, sorted_hist.size()); i++) {
-                samples.add(sorted_hist.get(i).vector.clone());
+                StreamingState.WeightedUtility wu = sorted_hist.get(i);
+
+                samples.add(wu.vector.clone(),
+                            wu.axisProvenance ? CurrentUtilityPool.Source.AXIS
+                                              : CurrentUtilityPool.Source.HIST);
             }
         }
 
@@ -187,13 +250,13 @@ public class StreamingRMS {
 
             for (int i = 0; i < Math.min(n_top, sorted_Q.size()); i++) {
                 double[] perturbed = perturbVector(sorted_Q.get(i).vector, 0.1, rand);
-                samples.add(perturbed);
+                samples.add(perturbed, CurrentUtilityPool.Source.SEED_TOP);
             }
 
             for (int i = 0; i < n_rand && sorted_Q.size() > 0; i++) {
                 int idx = rand.nextInt(sorted_Q.size());
                 double[] perturbed = perturbVector(sorted_Q.get(idx).vector, 0.15, rand);
-                samples.add(perturbed);
+                samples.add(perturbed, CurrentUtilityPool.Source.SEED_RANDOM);
             }
         }
 
@@ -208,7 +271,7 @@ public class StreamingRMS {
             double max_cos = -1;
             double[] u_max = null;
             if (!samples.isEmpty()) {
-                for (double[] u : samples) {
+                for (double[] u : samples.vectors) {
                     double cos = VectorUtil.cosine_unit(p, u);
                     if (cos > max_cos) {
                         max_cos = cos;
@@ -227,13 +290,16 @@ public class StreamingRMS {
                 }
             }
             VectorUtil.to_unit(u_new);
-            samples.add(u_new);
+            samples.add(u_new, CurrentUtilityPool.Source.NEW_DIRECTION);
         }
 
-        appendAxisSamples(samples);
+        if (state.axisSamplesEnabled) {
+            appendAxisSamples(samples);
+        }
         return finalizeSamples(samples);
     }
 
+    /** Reuses the initial stratified samples; reinitializes if the required sample count changes. */
     private double[][] generateFixedSamples(double[][] data) {
         int targetSize = Math.min(state.sample_size, data.length);
         boolean needInit = state.fixedSamples == null || state.fixedSamples.size() != targetSize;
@@ -245,21 +311,30 @@ public class StreamingRMS {
             }
         }
 
-        List<double[]> samples = new ArrayList<>();
+        SampleBuffer samples = new SampleBuffer();
         for (double[] sample : state.fixedSamples) {
-            samples.add(sample.clone());
+            samples.add(sample.clone(), CurrentUtilityPool.Source.FIXED);
         }
-        appendAxisSamples(samples);
+        if (state.axisSamplesEnabled) {
+            appendAxisSamples(samples);
+        }
         return finalizeSamples(samples);
     }
 
+    /** Regenerates stratified samples from the current ordered candidate set. */
     private double[][] generateUniformSamples(double[][] data) {
         int targetSize = Math.min(state.sample_size, data.length);
-        List<double[]> samples = sampleUniformCore(data, targetSize);
-        appendAxisSamples(samples);
+        SampleBuffer samples = new SampleBuffer();
+        for (double[] sample : sampleUniformCore(data, targetSize)) {
+            samples.add(sample, CurrentUtilityPool.Source.UNIFORM);
+        }
+        if (state.axisSamplesEnabled) {
+            appendAxisSamples(samples);
+        }
         return finalizeSamples(samples);
     }
 
+    /** Selects the midpoint index of each equal-size stratum; this is not uniform sampling on a sphere. */
     private List<double[]> sampleUniformCore(double[][] data, int targetSize) {
         List<double[]> samples = new ArrayList<>();
         if (data == null || data.length == 0 || targetSize <= 0) {
@@ -280,24 +355,30 @@ public class StreamingRMS {
         return samples;
     }
 
-    private void appendAxisSamples(List<double[]> samples) {
+    /** Adds one coordinate-axis direction per original attribute. */
+    private void appendAxisSamples(SampleBuffer samples) {
         for (int d = 0; d < dim; d++) {
             double[] axis = new double[dim + 1];
             axis[d] = 1.0;
             axis[dim] = 0.0;
-            samples.add(axis);
+            samples.add(axis, CurrentUtilityPool.Source.AXIS);
         }
     }
 
-    private double[][] finalizeSamples(List<double[]> samples) {
+    /** Normalizes the samples and binds each direction to its current-pool entry. */
+    private double[][] finalizeSamples(SampleBuffer samples) {
         double[][] result = new double[samples.size()][dim + 1];
+        CurrentUtilityPool pool = new CurrentUtilityPool();
         for (int i = 0; i < samples.size(); i++) {
-            result[i] = samples.get(i);
+            result[i] = samples.vectors.get(i);
             VectorUtil.to_unit(result[i]);
+            pool.add(result[i], samples.sources.get(i));
         }
+        this.currentPool = pool;
         return result;
     }
-    
+
+    /** Perturbs a direction and renormalizes it for utility sampling. */
     private double[] perturbVector(double[] v, double noise, Random rand) {
         double[] result = new double[v.length];
         for (int i = 0; i < v.length; i++) {
@@ -307,314 +388,479 @@ public class StreamingRMS {
         return result;
     }
 
-    private double[] resolveCurrentSampleWeights() {
-        double[] weights = new double[dualTree.sample_size];
+    /** Uses prior-set coverage gaps for non-axis weights and the configured weight for axis directions.
+     * Returns equal weights when feedback or objective weighting is disabled, or no prior set exists. */
+    private double[] computeHistoricalSupportWeights() {
+        int n = currentPool.size();
+        double[] weights = new double[n];
         Arrays.fill(weights, 1.0);
-        if (!state.utilityFeedbackEnabled) {
+        if (!state.utilityFeedbackEnabled || !state.objectiveWeightingEnabled || state.Q.isEmpty()) {
             return weights;
         }
-        if (state.U_hist.isEmpty()) {
-            return weights;
-        }
-
-        String samplingMode = StreamingState.normalizeSamplingMode(state.samplingMode);
-        if (StreamingState.SAMPLING_ADAPTIVE.equals(samplingMode)) {
-            int limit = Math.min(state.U_hist.size(), dualTree.sample_size);
-            for (int i = 0; i < limit; i++) {
-                weights[i] = state.U_hist.get(i).weight;
+        for (int i = 0; i < n; i++) {
+            if (currentPool.get(i).source == CurrentUtilityPool.Source.AXIS) {
+                weights[i] = state.axisObjectiveWeight;
+                continue;
             }
-            return weights;
-        }
-
-        Map<String, Double> histWeights = new HashMap<>();
-        for (StreamingState.WeightedUtility wu : state.U_hist) {
-            histWeights.put(vectorKey(wu.vector), wu.weight);
-        }
-        for (int i = 0; i < dualTree.sample_size; i++) {
-            weights[i] = histWeights.getOrDefault(vectorKey(dualTree.samples[i]), 1.0);
+            double maxCos = 0.0;
+            for (int point = 0; point < state.Q.size(); point++) {
+                double cos = dualTree.sampleDot(point, i);
+                if (cos > maxCos) {
+                    maxCos = cos;
+                }
+            }
+            weights[i] = coverageGapWeight(maxCos, dim);
         }
         return weights;
     }
-    
-    /** Recompute Q from current dual tree and advance window counter. */
+
+    /** Computes sqrt(dim) times the uncovered cosine fraction; the input dot product is scaled by sqrt(dim). */
+    public static double coverageGapWeight(double maxCosScaled, int dim) {
+        double repNorm = Math.sqrt(dim);
+        double trueCos = Math.min(1.0, Math.max(0.0, maxCosScaled / repNorm));
+        return repNorm * (1.0 - trueCos);
+    }
+
+    private boolean useKRMSObjective() {
+        return state != null && StreamingState.normalizeRmsK(state.rmsK) > 1;
+    }
+
+    private double magnitudeFactorOf(int pointIdx, double maxMagnitude, double minMagnitude) {
+        if (maxMagnitude > minMagnitude) {
+            return 0.5 + (dataMagnitudes[pointIdx] - minMagnitude)
+                / (maxMagnitude - minMagnitude);
+        }
+        return 1.0;
+    }
+
+    private double[] computeKThresholds(Phase2Scores rawScores, int totalSize, int utilitySize) {
+        double[] thresholds = new double[utilitySize];
+        if (totalSize == 0 || utilitySize == 0) {
+            return thresholds;
+        }
+
+        int heapCapacity = Math.min(StreamingState.normalizeRmsK(state.rmsK), totalSize);
+        for (int u = 0; u < utilitySize; u++) {
+            PriorityQueue<Double> topK = new PriorityQueue<>(heapCapacity);
+            for (int i = 0; i < totalSize; i++) {
+                double score = rawScores.get(i, u);
+                if (topK.size() < heapCapacity) {
+                    topK.offer(score);
+                } else if (score > topK.peek()) {
+                    topK.poll();
+                    topK.offer(score);
+                }
+            }
+            thresholds[u] = topK.isEmpty() ? 0.0 : topK.peek();
+        }
+        return thresholds;
+    }
+
+    private double applyKTruncation(double rawScore, double threshold) {
+        if (threshold <= 1e-12) {
+            return 0.0;
+        }
+        double ratio = Math.max(0.0, rawScore) / threshold;
+        String strategy = StreamingState.normalizeKTruncationStrategy(state.kTruncationStrategy);
+        if (StreamingState.K_TRUNCATION_SOFT.equals(strategy) && ratio > 1.0) {
+            double beta = StreamingState.normalizeKSoftBeta(state.kSoftBeta);
+            double gamma = StreamingState.normalizeKSoftGamma(state.kSoftGamma);
+            double eta = StreamingState.normalizeKSoftEta(state.kSoftEta);
+            return 1.0 + eta * Math.log1p(beta * gamma * (ratio - 1.0)) / beta;
+        }
+        return Math.min(ratio, 1.0);
+    }
+
+    private double marginalPart(double[] scoreRow, double[] currentMax,
+                                double[] utilityWeights, double[] uDirectionMax,
+                                int[] activeDirections, int activeCount) {
+        double total = 0.0;
+        for (int a = 0; a < activeCount; a++) {
+            int u = activeDirections[a];
+            double marginalGain = scoreRow[u] - currentMax[u];
+            if (marginalGain > 0.0) {
+                total += utilityWeights[u] * marginalGain / uDirectionMax[u];
+            }
+        }
+        return total;
+    }
+
+    /** Selects representatives, updates utility history and advances the stream state. */
     public void updateRepresentatives() {
-        long t0 = System.nanoTime();
-        
         int t = state.current_batch;
         int Q_size = state.Q.size();
         int total_size = dualTree.data_size;
-        
-        Map<Integer, Double> scores = computeWeightedScores(Q_size, t);
-        
+
+        long t0 = System.nanoTime();
+
+        currentPool.applyWeights(computeHistoricalSupportWeights());
+
+        StageDebug.logUtilityPool(t, currentPool);
+        StageDebug.logWeightBinding(t, currentPool, state.U_hist);
+
+        double[] scores = computeWeightedScores(Q_size, t);
+
         long t1 = System.nanoTime();
         this.scoringTime = (t1 - t0) / 1e6;
         this.scoringMemMB = usedMemMB();
-        
+
         List<StreamingState.Representative> new_Q = selectDiverseTopK(scores, Q_size, t);
-        
+
         updateUtilityHistory(new_Q);
-        
+
         long t2 = System.nanoTime();
         this.selectionTime = (t2 - t1) / 1e6;
         this.selectionMemMB = usedMemMB();
-        
+
         state.Q = new_Q;
-        
+
         state.prev_Q_indices.clear();
         for (StreamingState.Representative rep : new_Q) {
             state.prev_Q_indices.add(rep.original_idx);
         }
-        
+
         state.current_batch++;
         state.total_points_seen += (total_size - Q_size);
     }
-    
-    private Map<Integer, Double> computeWeightedScores(int Q_size, int t) {
-        Map<Integer, Double> scores = new HashMap<>();
-        double[] sampleWeights = resolveCurrentSampleWeights();
-        
+
+    /** Computes per-point scores for ranking and tie-breaking, including historical retention. */
+    private double[] computeWeightedScores(int Q_size, int t) {
+        double[] scores = new double[dualTree.data_size];
+
         if (state.globalMaxVals == null) {
             state.globalMaxVals = new double[dim];
             Arrays.fill(state.globalMaxVals, -Double.MAX_VALUE);
         }
-        
+
         double maxMagnitude = 0.0;
         double minMagnitude = Double.MAX_VALUE;
         for (int i = 0; i < dualTree.data_size; i++) {
             maxMagnitude = Math.max(maxMagnitude, dataMagnitudes[i]);
             minMagnitude = Math.min(minMagnitude, dataMagnitudes[i]);
         }
-        
-        for (int i = 0; i < dualTree.data_size; i++) {
+
+        final int dataSize = dualTree.data_size;
+        final int sampleSize = dualTree.sample_size;
+        final double[][] data = dualTree.data;
+        double[] rawWeights = new double[sampleSize];
+        for (int u_idx = 0; u_idx < sampleSize; u_idx++) {
+            rawWeights[u_idx] = currentPool.get(u_idx).rawWeight;
+        }
+
+        for (int i = 0; i < dataSize; i++) {
             double score = 0.0;
-            
+            double[] point = data[i];
+
             double magnitude_factor = 1.0;
             if (maxMagnitude > minMagnitude) {
+
                 magnitude_factor = 0.5 + (dataMagnitudes[i] - minMagnitude) / (maxMagnitude - minMagnitude);
             }
-            
+
             boolean isWorldRecord = false;
             for (int d = 0; d < dim; d++) {
-                double val = dualTree.data[i][d];
+                double val = point[d];
                 if (val > state.globalMaxVals[d]) {
                     state.globalMaxVals[d] = val;
                     isWorldRecord = true;
                 }
             }
-            
-            for (int u_idx = 0; u_idx < dualTree.sample_size; u_idx++) {
-                double cos = VectorUtil.inner_product(
-                    dualTree.data[i], 
-                    dualTree.samples[u_idx]
-                );
-                
-                double w_u = sampleWeights[u_idx];
-                
-                double time_factor = 1.0;
-                if (i < Q_size && t > 0) {
-                    int t_join = state.Q.get(i).t_join;
-                    time_factor = 1.0 + state.lambda * (t - t_join) / (double)t;
-                }
-                
+
+            double time_factor = 1.0;
+            if (i < Q_size) {
+                time_factor = StreamingState.timeFactor(
+                    t, state.Q.get(i).t_join, state.lambda);
+            }
+
+            for (int u_idx = 0; u_idx < sampleSize; u_idx++) {
+
+                double cos = dualTree.sampleDot(i, u_idx);
+
+                double w_u = rawWeights[u_idx];
+
                 score += w_u * cos * magnitude_factor * time_factor;
             }
-            
+
             if (isWorldRecord) {
                 score += state.worldRecordBonus;
             }
-            
-            scores.put(i, score / dualTree.sample_size);
+
+            scores[i] = score / sampleSize;
         }
-        
+
         return scores;
     }
-    
-    /**
-     * Two-phase greedy: pool by absolute score (top 5r), then marginal-gain style selection in pool.
-     */
+
+    /** Selects from the complete candidate set using weighted coverage and quality gains.
+     * Uses lazy recomputation with stable tie-breaking; non-finite scores fall back to a full scan. */
     private List<StreamingState.Representative> selectDiverseTopK(
-            Map<Integer, Double> scores, int Q_size, int t) {
+            double[] scores, int Q_size, int t) {
         String phase3Selection = StreamingState.normalizePhase3SelectionStrategy(
             state.phase3SelectionStrategy
         );
         if (StreamingState.PHASE3_SELECTION_ABSOLUTE_TOPR.equals(phase3Selection)) {
             return selectAbsoluteTopR(scores, Q_size, t);
         }
-        
+
         int total_size = dualTree.data_size;
-        
-        List<Integer> candidatePool = new ArrayList<>();
-        if (!scores.isEmpty()) {
-            List<Integer> allCandidates = new ArrayList<>(scores.keySet());
-            allCandidates.sort((a, b) -> Double.compare(scores.get(b), scores.get(a)));
-            
-            int poolSize = Math.min(state.r * 5, allCandidates.size());
-            for (int i = 0; i < poolSize; i++) {
-                candidatePool.add(allCandidates.get(i));
-            }
-        } else {
-            for (int i = 0; i < total_size; i++) {
-                candidatePool.add(i);
-            }
+
+        int[] candidateIndex = new int[total_size];
+        for (int i = 0; i < total_size; i++) {
+            candidateIndex[i] = i;
         }
-        
+
         List<double[]> utilityVectors = new ArrayList<>();
         List<Double> utilityWeights = new ArrayList<>();
-        String samplingMode = StreamingState.normalizeSamplingMode(state.samplingMode);
-        if (StreamingState.SAMPLING_ADAPTIVE.equals(samplingMode) && !state.U_hist.isEmpty()) {
-            for (StreamingState.WeightedUtility wu : state.U_hist) {
-                utilityVectors.add(wu.vector);
-                utilityWeights.add(wu.weight);
-            }
-        } else {
-            double[] sampleWeights = resolveCurrentSampleWeights();
-            for (int u_idx = 0; u_idx < dualTree.sample_size; u_idx++) {
-                utilityVectors.add(dualTree.samples[u_idx]);
-                utilityWeights.add(sampleWeights[u_idx]);
-            }
+        for (CurrentUtilityPool.Entry e : currentPool.entries()) {
+            utilityVectors.add(e.vector);
+            utilityWeights.add(e.normalizedWeight);
         }
-        
+        StageDebug.logPhase3Utilities(
+            t, "current_pool", currentPool, utilityVectors, utilityWeights);
+
         int U = utilityVectors.size();
+
+        double[] utilityWeightArray = new double[U];
+        for (int u = 0; u < U; u++) {
+            utilityWeightArray[u] = utilityWeights.get(u);
+        }
         double[] currentMax = new double[U];
         Arrays.fill(currentMax, 0.0);
-        
-        double[][] pointUtilityScores = new double[total_size][U];
-        
+
+        double[] uDirectionMax = new double[U];
+
         double maxMagnitude = 0.0;
         double minMagnitude = Double.MAX_VALUE;
         for (int i = 0; i < total_size; i++) {
             maxMagnitude = Math.max(maxMagnitude, dataMagnitudes[i]);
             minMagnitude = Math.min(minMagnitude, dataMagnitudes[i]);
         }
-        
-        for (int i = 0; i < total_size; i++) {
-            double magnitude_factor = 1.0;
-            if (maxMagnitude > minMagnitude) {
-                magnitude_factor = 0.5 + (dataMagnitudes[i] - minMagnitude) / 
-                                  (maxMagnitude - minMagnitude);
-            }
-            
-            double[] x = dualTree.data[i];
+
+        int candidateCount = candidateIndex.length;
+        if (useKRMSObjective()) throw new IllegalStateException("Scoring experiment requires k=1");
+        Phase2Scores phase2 = new Phase2Scores(candidateIndex, U);
+        Phase2Scores coverage = RAW_COVERAGE ? new Phase2Scores(candidateIndex, U) : phase2;
+        double[] coverageDen = RAW_COVERAGE ? new double[U] : uDirectionMax;
+        double[] qualityDen = new double[U];
+        double[] qualityCurrent = new double[U];
+
+        for (int c = 0; c < candidateCount; c++) {
+            int pointIdx = phase2.pointOf(c);
+
+            double magnitudeFactor = magnitudeFactorOf(pointIdx, maxMagnitude, minMagnitude);
+            double[] row = phase2.row(c);
+            double[] rawRow = coverage.row(c), point = dualTree.data[pointIdx];
             for (int u = 0; u < U; u++) {
-                double base = VectorUtil.cosine_unit(x, utilityVectors.get(u));
-                pointUtilityScores[i][u] = Math.max(0.0, base * magnitude_factor);
+                double base = dualTree.sampleDot(pointIdx, u);
+                if (base > uDirectionMax[u]) {
+                    uDirectionMax[u] = base;
+                }
+                row[u] = Math.max(0.0, base * magnitudeFactor);
+                qualityDen[u] = Math.max(qualityDen[u], row[u]);
+                if (RAW_COVERAGE) {
+                    double raw = 0.0;
+                    raw = dualTree.sampleRawDot(pointIdx, u);
+                    rawRow[u] = Math.max(0.0, raw);
+                    coverageDen[u] = Math.max(coverageDen[u], rawRow[u]);
+                }
             }
         }
-        
+        for (int u = 0; u < U; u++) {
+            if (!(uDirectionMax[u] > 1e-8)) {
+                uDirectionMax[u] = 1.0;
+            }
+        }
+
+        double[] maxEffPerDirection = coverageDen.clone();
+
+        for (int u = 0; u < U; u++) {
+            if (RAW_COVERAGE && !(coverageDen[u] > 0.0)) coverageDen[u] = 1.0;
+        }
+
+        if (useKRMSObjective()) {
+            double[] kThresholds = computeKThresholds(phase2, candidateCount, U);
+            for (int c = 0; c < candidateCount; c++) {
+                double[] row = phase2.row(c);
+                for (int u = 0; u < U; u++) {
+                    row[u] = applyKTruncation(row[u], kThresholds[u]);
+                }
+            }
+        }
+
+        int[] activeDirections = new int[U];
+        int activeCount = 0;
+        for (int u = 0; u < U; u++) {
+            activeDirections[activeCount++] = u;
+        }
+
+        int[] qualityActive = new int[U];
+        int qualityCount = 0;
+        if (QUALITY_MAX) for (int u = 0; u < U; u++)
+            if (qualityDen[u] > 0.0) qualityActive[qualityCount++] = u;
+
         List<StreamingState.Representative> new_Q = new ArrayList<>();
-        Set<Integer> usedInPool = new HashSet<>();
-        
-        while (new_Q.size() < state.r) {
+
+        boolean[] usedInPool = new boolean[total_size];
+
+        int targetSize = Math.min(state.r, candidateCount);
+        selectedPointIndices = new int[targetSize];
+        int[] gainHeap = new int[candidateCount], gainRound = new int[candidateCount];
+        double[] cachedGain = new double[candidateCount];
+        int heapSize = candidateCount;
+        boolean finiteGains = true;
+        for (int c = 0; c < candidateCount; c++) {
+            gainHeap[c] = c;
+            double gain = 0.0 + (1.0 - alpha) * marginalPart(
+                coverage.row(c), currentMax, utilityWeightArray, coverageDen, activeDirections, activeCount);
+            gain += alpha * marginalPart(phase2.row(c), qualityCurrent, utilityWeightArray,
+                qualityDen, qualityActive, qualityCount);
+            cachedGain[c] = gain;
+            if (!Double.isFinite(gain) || !Double.isFinite(scores[c])) finiteGains = false;
+        }
+        if (VERIFY_LAZY) lazyEvaluations += candidateCount;
+        if (finiteGains) for (int i = heapSize / 2 - 1; i >= 0; i--)
+            siftGainDown(gainHeap, heapSize, i, cachedGain, scores);
+        while (new_Q.size() < targetSize) {
             int bestIdx = -1;
-            double bestScore = -Double.MAX_VALUE;
+            int bestCandidatePos = -1;
             double bestTotalGain = 0.0;
-            
-            for (int idx : candidatePool) {
-                if (usedInPool.contains(idx)) continue;
-                
-                double absoluteQuality = scores.getOrDefault(idx, 0.0);
-                if (absoluteQuality < 0.3) {
+            double bestQuality = 0.0;
+
+            if (finiteGains) {
+                int round = new_Q.size();
+                while (gainRound[gainHeap[0]] != round && cachedGain[gainHeap[0]] != 0.0) {
+                    int c = gainHeap[0];
+                    double gain = 0.0 + (1.0 - alpha) * marginalPart(
+                        coverage.row(c), currentMax, utilityWeightArray, coverageDen,
+                        activeDirections, activeCount);
+                    gain += alpha * marginalPart(phase2.row(c), qualityCurrent, utilityWeightArray,
+                        qualityDen, qualityActive, qualityCount);
+                    if (VERIFY_LAZY) {
+                        lazyEvaluations++;
+                        if (!(gain <= cachedGain[c])) throw new AssertionError("Lazy bound increased");
+                    }
+                    cachedGain[c] = gain; gainRound[c] = round;
+                    siftGainDown(gainHeap, heapSize, 0, cachedGain, scores);
+                }
+                bestIdx = bestCandidatePos = gainHeap[0];
+                bestTotalGain = cachedGain[bestIdx]; bestQuality = scores[bestIdx];
+                heapSize--;
+                if (heapSize > 0) {
+                    gainHeap[0] = gainHeap[heapSize];
+                    siftGainDown(gainHeap, heapSize, 0, cachedGain, scores);
+                }
+            }
+            if (!finiteGains || VERIFY_LAZY) {
+                int heapBest = bestIdx;
+                double heapGain = bestTotalGain;
+                bestIdx = -1; bestCandidatePos = -1; bestTotalGain = 0.0; bestQuality = 0.0;
+            for (int c = 0; c < candidateCount; c++) {
+                int idx = phase2.pointOf(c);
+                if (usedInPool[idx]) {
                     continue;
                 }
-                
-                double totalGain = 0.0;
-                double alpha = this.alpha;
-                
-                for (int u = 0; u < U; u++) {
-                    double absoluteScore = pointUtilityScores[idx][u];
-                    double marginalGain = Math.max(0.0, absoluteScore - currentMax[u]);
-                    
-                    double mixedGain = (1.0 - alpha) * marginalGain + alpha * absoluteScore;
-                    totalGain += utilityWeights.get(u) * mixedGain;
-                }
-                
-                double finalScore = totalGain;
-                
-                if (finalScore > bestScore) {
-                    bestScore = finalScore;
+                double gain = 0.0 + (1.0 - alpha) * marginalPart(
+                    coverage.row(c), currentMax, utilityWeightArray, coverageDen,
+                    activeDirections, activeCount);
+                if (QUALITY_MAX) gain += alpha * marginalPart(
+                    phase2.row(c), qualityCurrent, utilityWeightArray, qualityDen,
+                    qualityActive, qualityCount);
+                double quality = scores[idx];
+
+                boolean better = bestIdx == -1
+                    || gain > bestTotalGain
+                    || (gain == bestTotalGain && quality > bestQuality)
+                    || (gain == bestTotalGain && quality == bestQuality && idx < bestIdx);
+                if (better) {
                     bestIdx = idx;
-                    bestTotalGain = totalGain;
+                    bestCandidatePos = c;
+                    bestTotalGain = gain;
+                    bestQuality = quality;
                 }
             }
-            
-            if (bestIdx == -1 && new_Q.size() < state.r) {
-                double fallbackBest = -Double.MAX_VALUE;
-                
-                for (int idx : candidatePool) {
-                    if (usedInPool.contains(idx)) continue;
-                    
-                    double rawScore = scores.getOrDefault(idx, 0.0);
-                    
-                    boolean isTooSimilar = false;
-                for (StreamingState.Representative rep : new_Q) {
-                        double cos = VectorUtil.cosine_unit(dualTree.data[idx], rep.vector);
-                        if (cos > 0.99) {
-                            isTooSimilar = true;
-                        break;
-                        }
-                    }
-                    
-                    double finalFallbackScore = isTooSimilar ? rawScore * 0.8 : rawScore;
-                    
-                    if (finalFallbackScore > fallbackBest) {
-                        fallbackBest = finalFallbackScore;
-                        bestIdx = idx;
-                        bestScore = finalFallbackScore;
-                    }
+
+                if (VERIFY_LAZY && finiteGains) {
+                    scanEquivalentEvaluations += candidateCount - new_Q.size();
+                    if (bestIdx != heapBest || Double.doubleToLongBits(bestTotalGain) != Double.doubleToLongBits(heapGain))
+                        throw new AssertionError("Lazy choice differs from full scan");
                 }
             }
-            
+
             if (bestIdx == -1) {
                 break;
             }
-            
+
+            double[] bestRow = coverage.row(bestCandidatePos);
             for (int u = 0; u < U; u++) {
-                double val = pointUtilityScores[bestIdx][u];
-                if (val > currentMax[u]) {
-                    currentMax[u] = val;
+                if (bestRow[u] > currentMax[u]) {
+                    currentMax[u] = bestRow[u];
                 }
             }
-            usedInPool.add(bestIdx);
-            
+            int kept = 0;
+            for (int a = 0; a < activeCount; a++) {
+                int u = activeDirections[a];
+                if (currentMax[u] < maxEffPerDirection[u]) {
+                    activeDirections[kept++] = u;
+                }
+            }
+            activeCount = kept;
+            if (QUALITY_MAX) {
+                double[] qualityRow = phase2.row(bestCandidatePos);
+                for (int u = 0; u < U; u++) qualityCurrent[u] = Math.max(qualityCurrent[u], qualityRow[u]);
+                int qKept = 0;
+                for (int a = 0; a < qualityCount; a++) {
+                    int u = qualityActive[a];
+                    if (qualityCurrent[u] < qualityDen[u]) qualityActive[qKept++] = u;
+                }
+                qualityCount = qKept;
+            }
+            usedInPool[bestIdx] = true;
+
             int t_join = t;
             int orig_idx = bestIdx;
             if (bestIdx < Q_size) {
                 t_join = state.Q.get(bestIdx).t_join;
                 orig_idx = state.Q.get(bestIdx).original_idx;
             }
-            
-            double repScore = scores.containsKey(bestIdx)
-                ? scores.get(bestIdx)
+
+            double repScore = bestIdx >= 0 && bestIdx < scores.length
+                ? scores[bestIdx]
                 : bestTotalGain / Math.max(1, U);
-                
+
+                selectedPointIndices[new_Q.size()] = bestIdx;
                 new_Q.add(new StreamingState.Representative(
-                dualTree.data[bestIdx].clone(), 
-                repScore, 
+                dualTree.data[bestIdx].clone(),
+                repScore,
                     t_join,
                     orig_idx
                 ));
             }
-        
+
         return new_Q;
     }
 
-    /** Phase-3 ablation: take top-r by precomputed absolute score only. */
+    /** Ranks by absolute scores without marginal-gain selection. */
     private List<StreamingState.Representative> selectAbsoluteTopR(
-            Map<Integer, Double> scores, int Q_size, int t) {
-        List<Integer> ranked = new ArrayList<>(scores.keySet());
-        ranked.sort((a, b) -> Double.compare(scores.getOrDefault(b, 0.0), scores.getOrDefault(a, 0.0)));
+            double[] scores, int Q_size, int t) {
+        List<Integer> ranked = new ArrayList<>(scores.length);
+        for (int idx = 0; idx < scores.length; idx++) {
+            ranked.add(idx);
+        }
+        ranked.sort((a, b) -> Double.compare(scores[b], scores[a]));
 
         int limit = Math.min(state.r, ranked.size());
+        selectedPointIndices = new int[limit];
         List<StreamingState.Representative> newQ = new ArrayList<>(limit);
         for (int i = 0; i < limit; i++) {
             int idx = ranked.get(i);
+            selectedPointIndices[i] = idx;
             int tJoin = t;
             int origIdx = idx;
             if (idx < Q_size) {
                 tJoin = state.Q.get(idx).t_join;
                 origIdx = state.Q.get(idx).original_idx;
             }
-            double repScore = scores.getOrDefault(idx, 0.0);
+            double repScore = scores[idx];
             newQ.add(new StreamingState.Representative(
                 dualTree.data[idx].clone(),
                 repScore,
@@ -624,40 +870,44 @@ public class StreamingRMS {
         }
         return newQ;
     }
-    
-    /** Similarity-based penalty vs current Q (optional; currently unused in main pick). */
+
     private double computeSoftPenalty(int idx, List<StreamingState.Representative> currentQ) {
         if (currentQ.isEmpty()) {
             return 1.0;
         }
-        
+
         double[] x = dualTree.data[idx];
         double maxCos = 0.0;
-        
+
         for (StreamingState.Representative rep : currentQ) {
             double cos = VectorUtil.cosine(x, rep.vector);
             if (cos > maxCos) {
                 maxCos = cos;
             }
         }
-        
+
         if (maxCos <= state.min_cos) {
             return 1.0;
         } else {
+
             double t = (maxCos - state.min_cos) / (1.0 - state.min_cos);
             return 1.0 - 0.7 * t;
         }
     }
-    
-    /** Log-sum welfare over utilities (optional fairness-style objective). */
+
     private double computeLogSumUtility(
             List<StreamingState.Representative> Q,
             List<double[]> utilityVectors,
             List<Double> utilityWeights) {
-        
+
         int U = utilityVectors.size();
+
+        double[] utilityWeightArray = new double[U];
+        for (int u = 0; u < U; u++) {
+            utilityWeightArray[u] = utilityWeights.get(u);
+        }
         double utility = 0.0;
-        
+
         for (int u = 0; u < U; u++) {
             double maxSim = 0.0;
             for (StreamingState.Representative rep : Q) {
@@ -668,141 +918,162 @@ public class StreamingRMS {
             }
             utility += utilityWeights.get(u) * Math.log(1.0 + maxSim);
         }
-        
+
         return utility;
     }
-    
-    /** True if v is (approximately) axis-aligned in the first dim coordinates. */
-    private boolean isAxisAligned(double[] v) {
-        int countNearOne = 0;
-        int countNearZero = 0;
-        double threshold = 0.95;
-        
-        for (int d = 0; d < dim; d++) {
-            if (Math.abs(v[d]) > threshold) {
-                countNearOne++;
-            } else if (Math.abs(v[d]) < 0.05) {
-                countNearZero++;
-            }
-        }
-        
-        return (countNearOne == 1 && countNearZero >= dim - 1);
-    }
-    
-    /** Refresh U_hist with mixed retention (low/high coverage, decline, axis-aligned always kept). */
+
+    /** Updates bounded direction history and preserves coordinate-axis provenance. */
     private void updateUtilityHistory(List<StreamingState.Representative> new_Q) {
-        List<StreamingState.WeightedUtility> new_U_hist = new ArrayList<>();
-        
+        int sampleCount = dualTree.sample_size;
+        List<StreamingState.WeightedUtility> new_U_hist = new ArrayList<>(sampleCount);
+
+        Set<DirectionKey> histSeen = new HashSet<>(sampleCount * 2);
+
         for (int u_idx = 0; u_idx < dualTree.sample_size; u_idx++) {
+            if (!histSeen.add(new DirectionKey(dualTree.samples[u_idx]))) {
+                continue;
+            }
+
             double max_cos = 0.0;
-            for (StreamingState.Representative rep : new_Q) {
-                double cos = VectorUtil.cosine_unit(rep.vector, dualTree.samples[u_idx]);
+            for (int selected = 0; selected < new_Q.size(); selected++) {
+                double cos = dualTree.sampleDot(selectedPointIndices[selected], u_idx);
                 if (cos > max_cos) {
                     max_cos = cos;
                 }
             }
-            
+
+            boolean isAxis = currentPool.get(u_idx).source == CurrentUtilityPool.Source.AXIS;
             double finalWeight = state.utilityFeedbackEnabled ? max_cos : 1.0;
-            if (state.utilityFeedbackEnabled && isAxisAligned(dualTree.samples[u_idx])) {
-                finalWeight = state.axisSpyWeight;
+            if (state.utilityFeedbackEnabled && isAxis) {
+                finalWeight = StreamingState.AXIS_RETENTION_PRIORITY;
             }
-            
+
             new_U_hist.add(new StreamingState.WeightedUtility(
-                dualTree.samples[u_idx].clone(), 
+                dualTree.samples[u_idx].clone(),
                 finalWeight,
-                state.current_batch
+                state.current_batch,
+                isAxis
             ));
         }
-        
+
         int maxSize = Math.min(state.max_U_hist, new_U_hist.size());
         List<StreamingState.WeightedUtility> finalHist = new ArrayList<>();
-        
+
+        Set<StreamingState.WeightedUtility> finalHistSeen =
+            Collections.newSetFromMap(new IdentityHashMap<>());
+
         List<StreamingState.WeightedUtility> axisSpies = new ArrayList<>();
         List<StreamingState.WeightedUtility> nonAxisVectors = new ArrayList<>();
-        
+
         for (StreamingState.WeightedUtility wu : new_U_hist) {
-            if (isAxisAligned(wu.vector)) {
+            if (wu.axisProvenance) {
                 axisSpies.add(wu);
             } else {
                 nonAxisVectors.add(wu);
             }
         }
-        
+
         finalHist.addAll(axisSpies);
-        
+        finalHistSeen.addAll(axisSpies);
+
         int remainingSlots = Math.max(0, maxSize - axisSpies.size());
-        
+
         nonAxisVectors.sort((a, b) -> Double.compare(a.weight, b.weight));
-        
+
         double minCoverageThreshold = 0.05;
         int lowCount = (int)(remainingSlots * 0.1);
         int addedLow = 0;
         for (int i = 0; i < nonAxisVectors.size() && addedLow < lowCount; i++) {
             if (nonAxisVectors.get(i).weight >= minCoverageThreshold) {
                 finalHist.add(nonAxisVectors.get(i));
+                finalHistSeen.add(nonAxisVectors.get(i));
                 addedLow++;
             }
         }
-        
+
         int highCount = (int)(remainingSlots * 0.5);
         int startHigh = Math.max(0, nonAxisVectors.size() - highCount);
         for (int i = startHigh; i < nonAxisVectors.size(); i++) {
-            if (!finalHist.contains(nonAxisVectors.get(i))) {
+            if (finalHistSeen.add(nonAxisVectors.get(i))) {
                 finalHist.add(nonAxisVectors.get(i));
             }
         }
-        
+
         if (!state.U_hist.isEmpty()) {
-            Map<String, Double> oldWeights = new HashMap<>();
+
+            Map<String, Double> oldWeights = new HashMap<>(state.U_hist.size() * 2);
             for (StreamingState.WeightedUtility old : state.U_hist) {
+
                 String key = vectorKey(old.vector);
                 oldWeights.put(key, old.weight);
             }
-            
+
             List<StreamingState.WeightedUtility> declined = new ArrayList<>();
+            Map<StreamingState.WeightedUtility, Double> dropOf = new IdentityHashMap<>();
             for (StreamingState.WeightedUtility wu : nonAxisVectors) {
                 String key = vectorKey(wu.vector);
-                if (oldWeights.containsKey(key)) {
-                    double drop = oldWeights.get(key) - wu.weight;
+                Double oldWeight = oldWeights.get(key);
+                if (oldWeight != null) {
+                    double drop = oldWeight - wu.weight;
                     if (drop > 0.1) {
-                        if (!finalHist.contains(wu)) {
+                        if (!finalHistSeen.contains(wu)) {
                             declined.add(wu);
+                            dropOf.put(wu, drop);
                         }
                     }
                 }
             }
-            
-            declined.sort((a, b) -> {
-                double dropA = oldWeights.getOrDefault(vectorKey(a.vector), 0.0) - a.weight;
-                double dropB = oldWeights.getOrDefault(vectorKey(b.vector), 0.0) - b.weight;
-                return Double.compare(dropB, dropA);
-            });
-            
+
+            declined.sort((a, b) -> Double.compare(dropOf.get(b), dropOf.get(a)));
+
             int declineCount = (int)(remainingSlots * 0.2);
             for (int i = 0; i < Math.min(declineCount, declined.size()); i++) {
                 finalHist.add(declined.get(i));
+                finalHistSeen.add(declined.get(i));
             }
         }
-        
-        Random rand = new Random(state.current_batch);
+
+        Random rand = new Random(state.retentionSeed());
         while (finalHist.size() < maxSize && nonAxisVectors.size() > 0) {
             StreamingState.WeightedUtility wu = nonAxisVectors.get(rand.nextInt(nonAxisVectors.size()));
-            if (!finalHist.contains(wu)) {
+            if (finalHistSeen.add(wu)) {
                 finalHist.add(wu);
             }
         }
-        
+
         state.U_hist = new ArrayList<>(finalHist);
     }
-    
+
     private String vectorKey(double[] vec) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < Math.min(3, vec.length); i++) {
-            sb.append(String.format("%.3f,", vec[i]));
-        }
-        return sb.toString();
+        return state.historyVectorKey(vec);
     }
-    
+
+    /** Quantizes directions for stable deduplication within the sample pool. */
+    private static final class DirectionKey {
+        private static final double SCALE = 1e9;
+        private final long[] fixed;
+        private final int hash;
+
+        DirectionKey(double[] vec) {
+            fixed = new long[vec.length];
+            for (int i = 0; i < vec.length; i++) {
+                fixed[i] = Math.round(vec[i] * SCALE);
+            }
+            hash = Arrays.hashCode(fixed);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof DirectionKey
+                && Arrays.equals(fixed, ((DirectionKey) other).fixed);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+    }
+
     public Set<Integer> getRepresentatives() {
         Set<Integer> result = new HashSet<>();
         for (StreamingState.Representative rep : state.Q) {
@@ -810,17 +1081,21 @@ public class StreamingRMS {
         }
         return result;
     }
-    
+
     public DualTree getDualTree() {
+        dualTree.materializeSearchResults();
         return dualTree;
     }
-    
+
     public boolean isIncrementalUsed() {
         return incrementalUsed;
     }
-    
+
     public double[][] getCurrentSamples() {
         return dualTree.samples;
     }
-}
 
+    public CurrentUtilityPool getCurrentPool() {
+        return currentPool;
+    }
+}

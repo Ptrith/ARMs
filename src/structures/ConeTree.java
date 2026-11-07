@@ -4,6 +4,7 @@ import utils.*;
 
 import java.util.*;
 
+/** Cone-tree index over utility directions. */
 public class ConeTree {
 
     private final DualTree dualTree;
@@ -16,8 +17,14 @@ public class ConeTree {
 
     double[][] samples;
     public TopKResult[] topKResults;
+    private boolean searchResultsPending;
 
     public ConeTree(int dim, int k, double eps, double tau, DualTree dualTree) {
+        this(dim, k, eps, tau, dualTree, false);
+    }
+
+    /** Only the privately owned immutable streaming index defers unused search results. */
+    ConeTree(int dim, int k, double eps, double tau, DualTree dualTree, boolean deferSearchResults) {
         this.dim = dim;
         this.k = k;
         this.eps = eps;
@@ -30,8 +37,8 @@ public class ConeTree {
         this.samples = dualTree.samples;
 
         this.topKResults = new TopKResult[sample_size];
-        for (int i = 0; i < sample_size; i++)
-            this.topKResults[i] = this.dualTree.tIdx.approxTopKSearch(this.k, this.eps, this.samples[i]);
+        this.searchResultsPending = deferSearchResults;
+        if (!deferSearchResults) initializeSearchResults();
 
         List<Integer> utilities = new ArrayList<>();
         for (int i = 0; i < sample_size; i++) {
@@ -41,7 +48,33 @@ public class ConeTree {
         this.root = new ConeNode(null, utilities);
     }
 
+    private void initializeSearchResults() {
+        for (int i = 0; i < topKResults.length; i++) {
+            topKResults[i] = dualTree.tIdx.approxTopKSearch(k, eps, samples[i], dualTree.sampleDotCache(i));
+        }
+    }
+
+    void materializeSearchResults() {
+        if (!searchResultsPending) return;
+        initializeSearchResults();
+        refreshMinimumScores(root);
+        searchResultsPending = false;
+    }
+
+    private double refreshMinimumScores(ConeNode node) {
+        node.min_k_score = Double.MAX_VALUE;
+        if (node.nodeType == NodeType.LEAF) {
+            for (int utility : node.utilities) {
+                node.min_k_score = Math.min(topKResults[utility].k_score, node.min_k_score);
+            }
+        } else {
+            node.min_k_score = Math.min(refreshMinimumScores(node.lc), refreshMinimumScores(node.rc));
+        }
+        return node.min_k_score;
+    }
+
     public void BFSTraverse() {
+        materializeSearchResults();
         LinkedList<ConeNode> queue = new LinkedList<>();
         queue.add(root);
         while (!queue.isEmpty()) {
@@ -55,6 +88,7 @@ public class ConeTree {
     }
 
     void insert(int t_idx, Operations opr) {
+        materializeSearchResults();
         LinkedList<ConeNode> queue = new LinkedList<>();
         queue.addLast(root);
         while (!queue.isEmpty()) {
@@ -85,6 +119,7 @@ public class ConeTree {
     }
 
     void delete(int t_idx, Operations opr) {
+        materializeSearchResults();
         LinkedList<ConeNode> queue = new LinkedList<>();
         queue.addLast(root);
         while (!queue.isEmpty()) {
@@ -190,7 +225,9 @@ public class ConeTree {
             for (int u_idx : utilities) {
                 double cosine = VectorUtil.cosine_unit(samples[u_idx], this.centroid);
                 this.cosine_aperture = Math.min(cosine, this.cosine_aperture);
-                this.min_k_score = Math.min(topKResults[u_idx].k_score, min_k_score);
+                if (!searchResultsPending) {
+                    this.min_k_score = Math.min(topKResults[u_idx].k_score, min_k_score);
+                }
             }
 
             if (this.cosine_aperture < tau) {

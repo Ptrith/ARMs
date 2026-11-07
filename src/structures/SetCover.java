@@ -119,7 +119,7 @@ public class SetCover {
                 else
                     right = mid - 1;
             }
-            
+
             if (m == 0)
                 m = left;
 

@@ -3,6 +3,7 @@ package structures;
 import utils.*;
 import java.util.*;
 
+/** Spatial index over tuples, supporting utility-dependent score queries. */
 public class KdTree {
 
     private final KdNode root;
@@ -102,6 +103,10 @@ public class KdTree {
     }
 
     TopKResult approxTopKSearch(int k, double eps, double[] u) {
+        return approxTopKSearch(k, eps, u, null);
+    }
+
+    TopKResult approxTopKSearch(int k, double eps, double[] u, double[] cachedScores) {
         TopKResult result = new TopKResult(k, eps);
 
         KdNode best_node = root;
@@ -114,7 +119,7 @@ public class KdTree {
         }
 
         for (int t_idx : best_node.tuples) {
-            double score = VectorUtil.inner_product(u, data[t_idx]);
+            double score = queryScore(u, t_idx, cachedScores);
             result.update(t_idx, score);
         }
 
@@ -131,7 +136,7 @@ public class KdTree {
                 if (cur_node == best_node)
                     continue;
                 for (int t_idx : cur_node.tuples) {
-                    double score = VectorUtil.inner_product(u, data[t_idx]);
+                    double score = queryScore(u, t_idx, cachedScores);
                     boolean k_score_update = result.update(t_idx, score);
 
                     if (k_score_update) {
@@ -153,6 +158,16 @@ public class KdTree {
         result.initResults();
 
         return result;
+    }
+
+    private double queryScore(double[] u, int pointIdx, double[] cachedScores) {
+        if (cachedScores == null) return VectorUtil.inner_product(u, data[pointIdx]);
+        double value = cachedScores[pointIdx];
+        if (Double.isNaN(value)) {
+            value = VectorUtil.inner_product(u, data[pointIdx]);
+            cachedScores[pointIdx] = value;
+        }
+        return value;
     }
 
     public List<RankItem> exactTopK(int k, double[] u) {

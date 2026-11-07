@@ -7,7 +7,7 @@ public class RMSInst {
 
     DualTree dualTree;
     public SetCover sc;
-    
+
     public double initTime = 0.0, addTreeTime = 0.0, addCovTime = 0.0, delTreeTime = 0.0, delCovTime = 0.0;
 
     public RMSInst(int dim, int k, int r, double eps, int data_size, int init_size, int sample_size, double[][] data,
