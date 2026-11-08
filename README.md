@@ -5,7 +5,7 @@
 
 ## Overview
 
-A regret minimization set (RMS) is a small subset of a dataset that represents user preferences over its attributes. AS-SRMS maintains such a representative set as tuples arrive in a stream. It adapts sampled utility directions using retained history, directions derived from current representatives, and incoming data.
+A regret minimization set (RMS) is a small subset of a dataset that represents user preferences over its attributes. ARMs maintains such a representative set as tuples arrive in a stream. It adapts sampled utility directions using retained history, directions derived from current representatives, and incoming data.
 
 For each input batch, the implementation forms a candidate set from the previous representatives and the new tuples, constructs utility directions and weights, and selects up to `r` representatives using a mixed coverage-and-quality objective. The representative set and utility history are carried forward to the next batch; the full input is not retained as an in-memory candidate set.
 
@@ -118,20 +118,29 @@ No precompiled application binary is required. Re-run `build.sh` after editing t
 
 ## Configuration
 
-The following are the values explicitly passed by `run.sh`, not necessarily the defaults of a bare Java invocation. Edit the corresponding variables or flags in that script when using a different configuration.
+The main parameters are the representative budget `r` and the four parameters examined in the paper's sensitivity study: α, λ, `m`, and `w`. The table gives the settings used by `run.sh`, which explicitly supplies the paper configuration rather than relying on the defaults of a bare Java invocation.
+
+| Parameter | Java flag | Launcher default | Meaning |
+| --- | --- | --- | --- |
+| Representative budget `r` | `-r` | `15` | Upper bound on the returned set size. |
+| Mixing coefficient α | `-a` | `0.6` | Balances directional coverage and quality; larger values give more weight to quality. |
+| Historical-retention coefficient λ | `-l` | `0.7` | Controls the age-dependent retention factor, not temporal decay. |
+| Utility-vector budget `m` | `-m` | `100` | Nominal budget for adaptive direction construction. |
+| Batch size `w` | `-ws` | `100` | Number of tuples processed per update. |
+
+Change `r` through the launcher argument, for example `./run.sh Colors 25`. To change α, `m`, or `w`, edit `alpha`, `samples`, or `batch_size` in `run.sh`; change λ through its `-l` flag. The launcher does not accept extra Java flags as positional arguments. Deduplication and the subsequent addition of missing coordinate axes affect the final direction-pool size, so it need not equal `m`. Here `w` is a processing batch size, not a historical-data expiration horizon.
+
+The remaining settings follow the paper: historical and seed-direction ratios γ₁ = 0.6 and γ₂ = 0.2, lifted-alignment threshold τ = 0.985, interpolation coefficient β = 0.8, and axis objective weight 10. Remaining construction capacity is assigned to new-data directions before adding missing coordinate axes. Perturbation radii are 0.10 for top-ranked seeds and 0.15 for randomly selected seeds. The launcher fixes the algorithm seed at 42; this is separate from the preprocessing and external evaluation seeds.
+
+<details>
+<summary>Advanced configuration, runtime options, and ablations</summary>
+
+The Java flags for γ₁, γ₂, τ, axis objective weight, and algorithm seed are `-rh`, `-rs`, `-t`, `-aw`, and `-sd`, respectively. The interpolation coefficient β and the two perturbation radii are fixed in the implementation, not exposed by the launcher. The unrelated `-k_soft_beta` option does not control this interpolation coefficient.
+
+The following switches select implementation modes or ablation variants; they are not additional hyperparameters in the paper's sensitivity study.
 
 | Setting | Java flag | Launcher value | Meaning |
 | --- | --- | --- | --- |
-| Representative budget | `-r` | Positional argument, default `15` | Upper bound on the output-set size. |
-| Mixed-objective coefficient | `-a` | `0.6` | Weight of the quality component relative to coverage. |
-| Axis objective weight | `-aw` | `10` | Weight assigned to coordinate-axis directions when objective weighting is active. |
-| Algorithm seed | `-sd` | `42` | Reproducible randomized sampling and retention. |
-| Batch size | `-ws` | `100` | Tuples read per batch in packed-stream mode. |
-| Sampling budget | `-m` | `100` | Nominal sampling budget; deduplication and added axis directions affect actual pool size. |
-| Historical retention strength | `-l` | `0.7` | Controls the age-dependent retention factor; it is not a temporal decay parameter. |
-| Direction similarity threshold | `-t` | `0.985` | Used when constructing adaptive directions. |
-| Diversity threshold | `-c` | `0.99` | Cosine threshold used by the relevant selection logic. |
-| History / seed / new ratios | `-rh -rs -rn` | `0.6 0.2 0.2` | Sampling-mixture settings; unused capacity can be filled by new directions. |
 | Sampling mode | `-sm` | `adaptive` | Adaptive direction generation. |
 | Axis samples | `-ase` | `true` | Enables coordinate-axis probes. |
 | Utility feedback | `-uf` | `true` | Enables feedback into utility weighting and history. |
@@ -143,7 +152,9 @@ The following are the values explicitly passed by `run.sh`, not necessarily the 
 | Index approximation parameter | `-e` | `0.01` | Parameter passed to the indexing routines. |
 | Reduced-output runtime | `-fe` | `true` | Buffers output and avoids per-batch detailed exports and quality diagnostics. |
 
-The axis objective weight is separate from the fixed axis history-retention priority of 100. Changing `-aw` does not change that retention priority. The seed for Colors preprocessing is also separate from the algorithm seed `-sd`.
+The axis objective weight is separate from the fixed axis history-retention priority of 100. Changing `-aw` does not change that retention priority.
+
+Two legacy flags are retained for compatibility but are not tuning parameters for the current adaptive mixed-gain path: `-c` sets a threshold used only in an unused legacy penalty function, and `-rn` stores a new-direction ratio while adaptive construction uses the capacity remaining after history and seed construction. The launcher retains their historical values (`0.99` and `0.2`); changing them does not adjust this path's diversity penalty or new-direction allocation.
 
 ### Other supported modes
 
@@ -158,7 +169,14 @@ These switches remain available through the Java CLI:
 
 Use a fresh output directory for each configuration; do not reuse a checkpoint from a different configuration or input stream.
 
+</details>
+
 ## Direct CLI usage and custom inputs
+
+For the four included datasets, use `run.sh`. The direct Java command and compatibility options for custom inputs are available below.
+
+<details>
+<summary>Custom-input command, batch files, and checkpoints</summary>
 
 The recommended packed-stream mode reads one decompressed file sequentially. It is not necessary to create thousands of individual batch files. The following example assumes a normalized custom file `my_data.txt` with 10,000 tuples and four attributes:
 
@@ -179,6 +197,8 @@ Replace the file, dimension, and batch count with your own values. In packed mod
 For compatibility with existing split inputs, omit `-sf` and pass a file prefix with `-i`. For batch index `t`, the reader first checks `<prefix>_batch_<t>.txt`, then `<prefix>_sliding_window_<t>.txt`. Indices start at zero, and `-n` is the total number of batches expected.
 
 Unlike the launcher, a direct Java invocation can load an existing `-s` checkpoint and continue from its saved batch. Only do this with the same input, ordering, and configuration. The direct entry point can stop early on missing input; inspect `runtime_meta.txt` to verify completion. The launcher performs this final-batch check automatically.
+
+</details>
 
 ## Outputs and timing
 
