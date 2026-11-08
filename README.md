@@ -1,4 +1,4 @@
-# AS-SRMS: Streaming Sampled Regret Minimization Set
+# ARMs: Regret Minimization on Streaming Data
 
 [![Java](https://img.shields.io/badge/Java-21%2B-orange.svg)](https://adoptium.net/)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-lightgrey.svg)](#requirements)
@@ -16,8 +16,8 @@ Input is processed in consecutive batches. A batch is a processing unit, **not a
 ## Quick start
 
 ```bash
-git clone --depth 1 https://github.com/Ptrith/AS-SRMS.git
-cd AS-SRMS
+git clone --depth 1 https://github.com/Ptrith/ARMs.git
+cd ARMs
 ./build.sh
 ./run.sh Colors 15
 ```
@@ -232,7 +232,7 @@ The core program does **not** compute the paper's sampled maximum regret ratio o
 
 ## Dependencies and licensing
 
-Apache Commons CLI is distributed under its own license; see [`libs/LICENSE.txt`](libs/LICENSE.txt) and [`libs/NOTICE.txt`](libs/NOTICE.txt). Those files cover the dependency, not the AS-SRMS project or its datasets. No separate project-wide license is currently included. Dataset redistribution and reuse are subject to the respective source terms.
+Apache Commons CLI is distributed under its own license; see [`libs/LICENSE.txt`](libs/LICENSE.txt) and [`libs/NOTICE.txt`](libs/NOTICE.txt). Those files cover the dependency, not this project or its datasets. No separate project-wide license is currently included. Dataset redistribution and reuse are subject to the respective source terms.
 
 ## Contributing and contact
 
