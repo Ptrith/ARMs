@@ -9,9 +9,9 @@ A regret minimization set (RMS) is a small subset of a dataset that represents u
 
 For each input batch, the implementation forms a candidate set from the previous representatives and the new tuples, constructs utility directions and weights, and selects up to `r` representatives using a mixed coverage-and-quality objective. The representative set and utility history are carried forward to the next batch; the full input is not retained as an in-memory candidate set.
 
-This repository contains the updated, accelerated Java implementation and the **Colors, AQ, HALO, and Household** inputs. It does not bundle experiment results, figures, benchmark runners, or baseline implementations. The supplied launcher uses **alpha = 0.6**, **axis weight = 10**, and **seed = 42**. The current mixed-gain objective is intended for **1-RMS** (`-k 1 -rk 1`).
+This repository contains the updated, accelerated Java implementation and the Colors, AQ, HALO, and Household inputs. It does not bundle experiment results, figures, benchmark runners, or baseline implementations. The supplied launcher uses alpha = 0.6, axis weight = 10, and seed = 42. The current mixed-gain objective is intended for 1-RMS (`-k 1 -rk 1`).
 
-Input is processed in consecutive batches. A batch is a processing unit, **not an expiring sliding window**: representatives summarize the processed stream rather than only the most recent batch.
+Input is processed in consecutive batches. A batch is a processing unit, not an expiring sliding window: representatives summarize the processed stream rather than only the most recent batch.
 
 ## Quick start
 
@@ -22,7 +22,7 @@ cd ARMs
 ./run.sh Colors 15
 ```
 
-The first run decompresses the selected input into `.cache/`. Subsequent runs reuse that cache. Each run writes to a **new** directory under `result/` and prints the path to `final_representatives.txt` on completion.
+The first run decompresses the selected input into `.cache/`. Subsequent runs reuse that cache. Each run writes to a new directory under `result/` and prints the path to `final_representatives.txt` on completion.
 
 Run the other included datasets with the same representative budget:
 
@@ -42,10 +42,10 @@ For example, `./run.sh Colors 25 result/colors_r25` selects a budget of 25 and a
 
 ## Requirements
 
-- **JDK 21 or newer**, with `java` and `javac` on `PATH`, or a valid `JAVA_HOME` pointing to a JDK.
-- **Bash** and **gzip**. The launch scripts target macOS, Linux, and WSL. Windows users should use WSL for the documented commands.
-- **Apache Commons CLI 1.4**, included as `libs/commons-cli-1.4.jar`.
-- Enough disk space for the compressed inputs and their decompressed caches. The launcher permits a maximum Java heap of **2 GB** (`-Xmx2g`).
+- JDK 21 or newer, with `java` and `javac` on `PATH`, or a valid `JAVA_HOME` pointing to a JDK.
+- Bash and gzip. The launch scripts target macOS, Linux, and WSL. Windows users should use WSL for the documented commands.
+- Apache Commons CLI 1.4, included as `libs/commons-cli-1.4.jar`.
+- Enough disk space for the compressed inputs and their decompressed caches. The launcher permits a maximum Java heap of 2 GB (`-Xmx2g`).
 
 Python, Maven, Gradle, ONNX Runtime, and Git LFS are not required to build or run this package.
 
@@ -74,11 +74,11 @@ Python, Maven, Gradle, ONNX Runtime, and Git LFS are not required to build or ru
 | HALO | `dataset/HALO.txt.gz` | 1,113,189 | 33 | 11,132 |
 | Household | `dataset/Household.txt.gz` | 2,049,280 | 7 | 20,493 |
 
-These are the prepared numerical inputs, not raw source records. All attributes are used with the **larger-is-better** convention, and the included coordinates lie in `[0,1]`. The compressed files preserve the values and ordering of the existing prepared inputs.
+These are the prepared numerical inputs, not raw source records. All attributes are used with the larger-is-better convention, and the included coordinates lie in `[0,1]`. The compressed files preserve the values and ordering of the existing prepared inputs.
 
-For Colors, each attribute has been min–max normalized, rounded to six decimal places, and placed in a fixed random order using seed 42. This permutation defines the input stream; the launcher does **not** reshuffle the data at each run. The other inputs retain their prepared order. **HALO corresponds to the input previously named STAQS in the project.**
+For Colors, each attribute has been min–max normalized, rounded to six decimal places, and placed in a fixed random order using seed 42. This permutation defines the input stream; the launcher does not reshuffle the data at each run. The other inputs retain their prepared order. HALO corresponds to the input previously named STAQS in the project.
 
-The AQ file contains all **382,168** online input tuples. If comparing against historical evaluations that used a 380,000-tuple reference prefix, explicitly use that same prefix in the external evaluator; the launcher does not truncate the stream.
+The AQ file contains all 382,168 online input tuples. If comparing against historical evaluations that used a 380,000-tuple reference prefix, explicitly use that same prefix in the external evaluator; the launcher does not truncate the stream.
 
 ### Text format
 
@@ -118,7 +118,7 @@ No precompiled application binary is required. Re-run `build.sh` after editing t
 
 ## Configuration
 
-The following are the values **explicitly passed by `run.sh`**, not necessarily the defaults of a bare Java invocation. Edit the corresponding variables or flags in that script when using a different configuration.
+The following are the values explicitly passed by `run.sh`, not necessarily the defaults of a bare Java invocation. Edit the corresponding variables or flags in that script when using a different configuration.
 
 | Setting | Java flag | Launcher value | Meaning |
 | --- | --- | --- | --- |
@@ -143,7 +143,7 @@ The following are the values **explicitly passed by `run.sh`**, not necessarily 
 | Index approximation parameter | `-e` | `0.01` | Parameter passed to the indexing routines. |
 | Reduced-output runtime | `-fe` | `true` | Buffers output and avoids per-batch detailed exports and quality diagnostics. |
 
-The axis **objective weight** is separate from the fixed axis **history-retention priority** of 100. Changing `-aw` does not change that retention priority. The seed for Colors preprocessing is also separate from the algorithm seed `-sd`.
+The axis objective weight is separate from the fixed axis history-retention priority of 100. Changing `-aw` does not change that retention priority. The seed for Colors preprocessing is also separate from the algorithm seed `-sd`.
 
 ### Other supported modes
 
@@ -160,7 +160,7 @@ Use a fresh output directory for each configuration; do not reuse a checkpoint f
 
 ## Direct CLI usage and custom inputs
 
-The recommended **packed-stream** mode reads one decompressed file sequentially. It is not necessary to create thousands of individual batch files. The following example assumes a normalized custom file `my_data.txt` with **10,000 tuples and four attributes**:
+The recommended packed-stream mode reads one decompressed file sequentially. It is not necessary to create thousands of individual batch files. The following example assumes a normalized custom file `my_data.txt` with 10,000 tuples and four attributes:
 
 ```bash
 java -Xms256m -Xmx2g -Dfile.encoding=UTF-8 \
@@ -202,7 +202,7 @@ index <last_batch_index> <representative_count> <average_internal_score>
 ...
 ```
 
-The internal score is **not MRR**. Exported coordinates contain the original `d` attributes, formatted to six decimal places; the extra lifted coordinate is not exported. Treat `r` as an upper bound, not a promise that every possible input returns exactly `r` tuples.
+The internal score is not MRR. Exported coordinates contain the original `d` attributes, formatted to six decimal places; the extra lifted coordinate is not exported. Treat `r` as an upper bound, not a promise that every possible input returns exactly `r` tuples.
 
 Timing fields have different scopes:
 
@@ -214,7 +214,7 @@ With `-fe true`, quality diagnostics are computed only for the last batch, final
 
 ### MRR evaluation
 
-The core program does **not** compute the paper's sampled maximum regret ratio over the full reference dataset. The coverage, diversity, and average-score fields are internal diagnostics and must not be reported as MRR. Evaluate the exported representative set separately using a clearly specified reference dataset and utility-direction sample, shared across compared methods. The evaluation seed is independent of the algorithm seed. No paper-result tables or external MRR evaluation scripts are bundled here.
+The core program does not compute the paper's sampled maximum regret ratio over the full reference dataset. The coverage, diversity, and average-score fields are internal diagnostics and must not be reported as MRR. Evaluate the exported representative set separately using a clearly specified reference dataset and utility-direction sample, shared across compared methods. The evaluation seed is independent of the algorithm seed. No paper-result tables or external MRR evaluation scripts are bundled here.
 
 ## Troubleshooting
 
@@ -238,4 +238,4 @@ Apache Commons CLI is distributed under its own license; see [`libs/LICENSE.txt`
 
 Bug reports and focused improvements to documentation, portability, and implementation are welcome. When reporting an issue, include the JDK version, dataset/dimension, command, and relevant error message; do not commit generated results or caches.
 
-**Email:** [lzixu00@gmail.com](mailto:lzixu00@gmail.com)
+Email: [lzixu00@gmail.com](mailto:lzixu00@gmail.com)
